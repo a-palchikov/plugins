@@ -15,6 +15,7 @@
 package allocator
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -46,9 +47,6 @@ func (a *IPAllocator) Get(id string, ifname string, requestedIP net.IP) (*curren
 	a.store.Lock()
 	defer a.store.Unlock()
 
-	var reservedIP *net.IPNet
-	var gw net.IP
-
 	if requestedIP != nil {
 		if err := canonicalizeIP(&requestedIP); err != nil {
 			return nil, err
@@ -70,65 +68,66 @@ func (a *IPAllocator) Get(id string, ifname string, requestedIP net.IP) (*curren
 		if !reserved {
 			return nil, fmt.Errorf("requested IP address %s is not available in range set %s", requestedIP, a.rangeset.String())
 		}
-		reservedIP = &net.IPNet{IP: requestedIP, Mask: r.Subnet.Mask}
-		gw = r.Gateway
+		return &current.IPConfig{
+			Address: net.IPNet{IP: requestedIP, Mask: r.Subnet.Mask},
+			Gateway: r.Gateway,
+		}, nil
+	}
 
-	} else {
-		// try to get allocated IPs for this given id, if exists, just return error
-		// because duplicate allocation is not allowed in SPEC
-		// https://github.com/containernetworking/cni/blob/master/SPEC.md
-		allocatedIPs := a.store.GetByID(id, ifname)
-		for _, allocatedIP := range allocatedIPs {
-			// check whether the existing IP belong to this range set
-			if _, err := a.rangeset.RangeFor(allocatedIP); err == nil {
-				return nil, fmt.Errorf("%s has been allocated to %s, duplicate allocation is not allowed", allocatedIP.String(), id)
-			}
-		}
-
-		if ip, err := a.store.GetRevokedIPbyID(id, ifname); err != nil {
-			return nil, err
-		} else if ip != nil {
-			iter, err := a.GetIter()
-			if err != nil {
-				return nil, err
-			}
-
-			reservedIP, gw = iter.Next()
-			reservedIP.IP = ip
-
-			reserved, err := a.store.ReserveEphemeral(id, ifname, reservedIP.IP, a.rangeID)
-			if err != nil {
-				return nil, err
-			}
-			if !reserved {
-				reservedIP = nil
-			}
-		} else {
-			iter, err := a.GetIter()
-			if err != nil {
-				return nil, err
-			}
-			for {
-				reservedIP, gw = iter.Next()
-				if reservedIP == nil {
-					break
-				}
-
-				reserved, err := a.store.Reserve(id, ifname, reservedIP.IP, a.rangeID)
-				if err != nil {
-					return nil, err
-				}
-				if reserved {
-					break
-				}
-			}
+	// try to get allocated IPs for this given id, if exists, just return error
+	// because duplicate allocation is not allowed in SPEC
+	// https://github.com/containernetworking/cni/blob/master/SPEC.md
+	allocatedIPs := a.store.GetByID(id, ifname)
+	for _, allocatedIP := range allocatedIPs {
+		// check whether the existing IP belongs to this range set
+		if _, err := a.rangeset.RangeFor(allocatedIP); err == nil {
+			return nil, fmt.Errorf("%s has been allocated to %s, duplicate allocation is not allowed", allocatedIP.String(), id)
 		}
 	}
 
+	var reservedIP *net.IPNet
+	var gw net.IP
+	if ip, err := a.store.GetRevokedIPbyID(id, ifname); err != nil && !errors.Is(err, backend.ErrNotFound) {
+		return nil, err
+	} else if ip != nil {
+		iter, err := a.GetIter()
+		if err != nil {
+			return nil, err
+		}
+
+		reservedIP, gw = iter.Next()
+		reservedIP.IP = ip
+
+		reserved, err := a.store.ReserveEphemeral(id, ifname, reservedIP.IP, a.rangeID)
+		if err != nil {
+			return nil, err
+		}
+		if !reserved {
+			reservedIP = nil
+		}
+	} else {
+		iter, err := a.GetIter()
+		if err != nil {
+			return nil, err
+		}
+		for {
+			reservedIP, gw = iter.Next()
+			if reservedIP == nil {
+				break
+			}
+
+			reserved, err := a.store.Reserve(id, ifname, reservedIP.IP, a.rangeID)
+			if err != nil {
+				return nil, err
+			}
+			if reserved {
+				break
+			}
+		}
+	}
 	if reservedIP == nil {
 		return nil, fmt.Errorf("no IP addresses available in range set: %s", a.rangeset.String())
 	}
-
 	return &current.IPConfig{
 		Address: *reservedIP,
 		Gateway: gw,

@@ -14,7 +14,10 @@
 
 package backend
 
-import "net"
+import (
+	"errors"
+	"net"
+)
 
 type Store interface {
 	Lock() error
@@ -28,3 +31,6 @@ type Store interface {
 	GetRevokedIPbyID(id, ifname string) (net.IP, error)
 	GetByID(id, ifname string) []net.IP
 }
+
+// ErrNotFound indicates a not found error
+var ErrNotFound = errors.New("not found")

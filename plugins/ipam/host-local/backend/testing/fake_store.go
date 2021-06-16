@@ -22,7 +22,9 @@ import (
 )
 
 type FakeStore struct {
-	ipMap          map[string]string
+	ipMap map[string]string
+	// ipMapRevoked maps id->ips for released IPs
+	ipMapRevoked   map[string][]string
 	lastReservedIP map[string]net.IP
 }
 
@@ -30,7 +32,11 @@ type FakeStore struct {
 var _ backend.Store = &FakeStore{}
 
 func NewFakeStore(ipmap map[string]string, lastIPs map[string]net.IP) *FakeStore {
-	return &FakeStore{ipmap, lastIPs}
+	return &FakeStore{
+		ipMap:          ipmap,
+		ipMapRevoked:   make(map[string][]string),
+		lastReservedIP: lastIPs,
+	}
 }
 
 func (s *FakeStore) Lock() error {
@@ -45,11 +51,18 @@ func (s *FakeStore) Close() error {
 	return nil
 }
 
-func (s *FakeStore) Reserve(id string, ifname string, ip net.IP, rangeID string) (bool, error) {
+func (s *FakeStore) Reserve(id, ifname string, ip net.IP, rangeID string) (reserved bool, err error) {
+	if reserved, err = s.ReserveEphemeral(id, ifname, ip, rangeID); reserved {
+		s.lastReservedIP[rangeID] = ip
+		return true, nil
+	}
+	return false, nil
+}
+
+func (s *FakeStore) ReserveEphemeral(id, ifname string, ip net.IP, rangeID string) (bool, error) {
 	key := ip.String()
 	if _, ok := s.ipMap[key]; !ok {
 		s.ipMap[key] = id
-		s.lastReservedIP[rangeID] = ip
 		return true, nil
 	}
 	return false, nil
@@ -73,6 +86,7 @@ func (s *FakeStore) ReleaseByID(id string, ifname string) error {
 	for k, v := range s.ipMap {
 		if v == id {
 			toDelete = append(toDelete, k)
+			s.ipMapRevoked[id] = append(s.ipMapRevoked[id], k)
 		}
 	}
 	for _, ip := range toDelete {
@@ -93,4 +107,12 @@ func (s *FakeStore) GetByID(id string, ifname string) []net.IP {
 
 func (s *FakeStore) SetIPMap(m map[string]string) {
 	s.ipMap = m
+}
+
+func (s *FakeStore) GetRevokedIPbyID(id, ifname string) (net.IP, error) {
+	if ips, exists := s.ipMapRevoked[id]; exists {
+		// TODO: handle multiple IPs
+		return net.ParseIP(ips[0]), nil
+	}
+	return nil, backend.ErrNotFound
 }

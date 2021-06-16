@@ -250,7 +250,7 @@ var _ = Describe("host-local ip allocator", func() {
 			Expect(err).To(HaveOccurred())
 		})
 
-		It("should allocate in a round-robin fashion", func() {
+		It("should allocate the same IP for the same interface", func() {
 			alloc := mkalloc()
 			res, err := alloc.Get("ID", "eth0", nil)
 			Expect(err).ToNot(HaveOccurred())
@@ -260,6 +260,21 @@ var _ = Describe("host-local ip allocator", func() {
 			Expect(err).ToNot(HaveOccurred())
 
 			res, err = alloc.Get("ID", "eth0", nil)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(res.Address.String()).To(Equal("192.168.1.2/29"))
+
+		})
+
+		It("should allocate in a round-robin fashion", func() {
+			alloc := mkalloc()
+			res, err := alloc.Get("ID", "eth0", nil)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(res.Address.String()).To(Equal("192.168.1.2/29"))
+
+			err = alloc.Release("ID", "eth0")
+			Expect(err).ToNot(HaveOccurred())
+
+			res, err = alloc.Get("ID1", "eth0", nil)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(res.Address.String()).To(Equal("192.168.1.3/29"))
 

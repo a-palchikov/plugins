@@ -279,7 +279,7 @@ func (s *Store) GetRevokedIPbyID(id string, ifname string) (net.IP, error) {
 		if err != nil {
 			switch err {
 			case io.EOF:
-				return nil, nil
+				return nil, backend.ErrNotFound
 			default:
 				return nil, err
 			}
