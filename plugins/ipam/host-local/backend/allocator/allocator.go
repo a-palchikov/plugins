@@ -85,23 +85,42 @@ func (a *IPAllocator) Get(id string, ifname string, requestedIP net.IP) (*curren
 			}
 		}
 
-		iter, err := a.GetIter()
-		if err != nil {
+		if ip, err := a.store.GetRevokedIPbyID(id, ifname); err != nil {
 			return nil, err
-		}
-		for {
-			reservedIP, gw = iter.Next()
-			if reservedIP == nil {
-				break
-			}
-
-			reserved, err := a.store.Reserve(id, ifname, reservedIP.IP, a.rangeID)
+		} else if ip != nil {
+			iter, err := a.GetIter()
 			if err != nil {
 				return nil, err
 			}
 
-			if reserved {
-				break
+			reservedIP, gw = iter.Next()
+			reservedIP.IP = ip
+
+			reserved, err := a.store.ReserveEphemeral(id, ifname, reservedIP.IP, a.rangeID)
+			if err != nil {
+				return nil, err
+			}
+			if !reserved {
+				reservedIP = nil
+			}
+		} else {
+			iter, err := a.GetIter()
+			if err != nil {
+				return nil, err
+			}
+			for {
+				reservedIP, gw = iter.Next()
+				if reservedIP == nil {
+					break
+				}
+
+				reserved, err := a.store.Reserve(id, ifname, reservedIP.IP, a.rangeID)
+				if err != nil {
+					return nil, err
+				}
+				if reserved {
+					break
+				}
 			}
 		}
 	}

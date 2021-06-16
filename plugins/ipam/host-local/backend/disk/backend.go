@@ -15,6 +15,10 @@
 package disk
 
 import (
+	"bufio"
+	"errors"
+	"fmt"
+	"io"
 	"io/ioutil"
 	"net"
 	"os"
@@ -26,6 +30,7 @@ import (
 )
 
 const lastIPFilePrefix = "last_reserved_ip."
+const revokedIdIPFile = "revoked_id_ifname_ip_list" // <id>,<ifname>,<ip>
 const LineBreak = "\r\n"
 
 var defaultDataDir = "/var/lib/cni/networks"
@@ -56,7 +61,28 @@ func New(network, dataDir string) (*Store, error) {
 	return &Store{lk, dir}, nil
 }
 
-func (s *Store) Reserve(id string, ifname string, ip net.IP, rangeID string) (bool, error) {
+// Reserve reserves the specified IP with the given range and persists
+// reservation to the disk.
+func (s *Store) Reserve(id string, ifname string, ip net.IP, rangeID string) (reserved bool, err error) {
+	if reserved, err = s.ReserveEphemeral(id, ifname, ip, rangeID); err != nil {
+		return false, err
+	}
+	if !reserved {
+		return false, nil
+	}
+
+	// store the reserved IP in lastIPFile
+	ipfile := GetEscapedPath(s.dataDir, lastIPFilePrefix+rangeID)
+	err = ioutil.WriteFile(ipfile, []byte(ip.String()), 0644)
+	if err != nil {
+		return false, err
+	}
+	return reserved, nil
+}
+
+// ReserveEphemeral reserves the specified IP with the given range without updating
+// the last IP state.
+func (s *Store) ReserveEphemeral(id string, ifname string, ip net.IP, rangeID string) (bool, error) {
 	fname := GetEscapedPath(s.dataDir, ip.String())
 
 	f, err := os.OpenFile(fname, os.O_RDWR|os.O_EXCL|os.O_CREATE, 0644)
@@ -73,12 +99,6 @@ func (s *Store) Reserve(id string, ifname string, ip net.IP, rangeID string) (bo
 	}
 	if err := f.Close(); err != nil {
 		os.Remove(f.Name())
-		return false, err
-	}
-	// store the reserved ip in lastIPFile
-	ipfile := GetEscapedPath(s.dataDir, lastIPFilePrefix+rangeID)
-	err = ioutil.WriteFile(ipfile, []byte(ip.String()), 0644)
-	if err != nil {
 		return false, err
 	}
 	return true, nil
@@ -135,41 +155,84 @@ func (s *Store) FindByID(id string, ifname string) bool {
 	return found
 }
 
-func (s *Store) ReleaseByKey(id string, ifname string, match string) (bool, error) {
-	found := false
-	err := filepath.Walk(s.dataDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
+var errAbort = errors.New("iteration aborted")
+
+func (s *Store) releaseByKey(match string) (ip string, err error) {
+	err = filepath.Walk(s.dataDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
 			return nil
 		}
 		data, err := ioutil.ReadFile(path)
 		if err != nil {
-			return nil
+			return err
 		}
 		if strings.TrimSpace(string(data)) == match {
 			if err := os.Remove(path); err != nil {
-				return nil
+				return err
 			}
-			found = true
+			ip = filepath.Base(path)
+			return errAbort
 		}
 		return nil
 	})
-	return found, err
+	if err != errAbort {
+		return "", err
+	}
+	return ip, nil
+}
 
+func (s *Store) revokeIP(id, ifname, ip string) (err error) {
+	path := GetEscapedPath(s.dataDir, revokedIdIPFile)
+	record := fmt.Sprintf("%s,%s,%s\n", id, ifname, ip)
+
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		bytes, err := ioutil.ReadFile(path)
+		if err != nil {
+			return err
+		}
+
+		if !strings.Contains(string(bytes), record) {
+			return nil
+		}
+	}
+
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			return
+		}
+		err = file.Close()
+	}()
+
+	if _, err = file.WriteString(record); err != nil {
+		return err
+	}
+	return nil
 }
 
 // N.B. This function eats errors to be tolerant and
 // release as much as possible
 func (s *Store) ReleaseByID(id string, ifname string) error {
-	found := false
 	match := strings.TrimSpace(id) + LineBreak + ifname
-	found, err := s.ReleaseByKey(id, ifname, match)
-
-	// For backwards compatibility, look for files written by a previous version
-	if !found && err == nil {
-		match := strings.TrimSpace(id)
-		found, err = s.ReleaseByKey(id, ifname, match)
+	ip, err := s.releaseByKey(match)
+	if err != nil {
+		return err
 	}
-	return err
+	if ip == "" {
+		// For backwards compatibility, look for files written by a previous version
+		match = strings.TrimSpace(id)
+		ip, err = s.releaseByKey(match)
+		if err != nil {
+			return err
+		}
+	}
+	return s.revokeIP(id, ifname, ip)
 }
 
 // GetByID returns the IPs which have been allocated to the specific ID
@@ -199,6 +262,43 @@ func (s *Store) GetByID(id string, ifname string) []net.IP {
 	})
 
 	return ips
+}
+
+func (s *Store) GetRevokedIPbyID(id string, ifname string) (net.IP, error) {
+	path := GetEscapedPath(s.dataDir, revokedIdIPFile)
+
+	file, err := os.OpenFile(path, os.O_RDONLY|os.O_CREATE, 0644)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	reader := bufio.NewReader(file)
+	for {
+		str, err := reader.ReadString('\n')
+		if err != nil {
+			switch err {
+			case io.EOF:
+				return nil, nil
+			default:
+				return nil, err
+			}
+		}
+
+		idipPair := strings.SplitN(strings.TrimSuffix(str, "\n"), ",", 3)
+		if len(idipPair) != 3 {
+			return nil, errors.New(fmt.Sprintf(
+				"failed to get ID (%s:%s) and IP from %s",
+				id,
+				ifname,
+				path,
+			))
+		}
+
+		if idipPair[0] == id && idipPair[1] == ifname {
+			return net.ParseIP(idipPair[2]), nil
+		}
+	}
 }
 
 func GetEscapedPath(dataDir string, fname string) string {
